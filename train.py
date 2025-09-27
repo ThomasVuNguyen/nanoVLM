@@ -18,6 +18,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 from datasets import load_dataset, concatenate_datasets, get_dataset_config_names, load_from_disk
 import csv
 import json
+from tqdm import tqdm
 
 torch.manual_seed(0)
 if torch.cuda.is_available():
@@ -405,7 +406,14 @@ def train(train_cfg, vlm_cfg):
         data_load_start = time.time()
 
         print("Starting training loop")
-        for i, batch in enumerate(synchronized_dataloader_step(train_loader, is_dist())):
+        # Create progress bar for the epoch
+        pbar = tqdm(
+            enumerate(synchronized_dataloader_step(train_loader, is_dist())),
+            total=len(train_loader),
+            desc=f"Epoch {epoch}",
+            disable=not is_master()  # Only show on master process in distributed training
+        )
+        for i, batch in pbar:
             is_update_step = (i + 1) % train_cfg.gradient_accumulation_steps == 0 or i + 1 == len(train_loader)
             batch_start_time = time.time()
             images = batch["images"]
@@ -488,6 +496,14 @@ def train(train_cfg, vlm_cfg):
             accumulated_stats['fw_bw_time'].append(fw_bw_time)
             accumulated_stats['post_process_time'].append(post_process_time)
             accumulated_stats['images_per_sample'].extend(images_per_sample)
+            
+            # Update progress bar with current metrics
+            if is_master():
+                pbar.set_postfix({
+                    'loss': f'{batch_loss:.4f}',
+                    'tokens/s': f'{tokens_per_second:.1f}',
+                    'step': global_step
+                })
             
             if train_cfg.eval_in_epochs and global_step % train_cfg.eval_interval == 0 and is_update_step and global_step > 0:
                 model.eval()
@@ -641,6 +657,10 @@ def train(train_cfg, vlm_cfg):
                 if global_step >= train_cfg.max_training_steps:
                     break
             data_load_start = time.time()
+        
+        # Close progress bar for this epoch
+        if is_master():
+            pbar.close()
 
         avg_train_loss = total_train_loss / len(train_loader)
         # gather average batch loss from all ranks if DDP
