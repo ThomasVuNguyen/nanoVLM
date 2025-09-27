@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Bash(gh auth:*)",
+      "Bash(curl -X POST )",
+      "Bash(https://api.github.com/repos/huggingface/nanoVLM/forks)",
+      "Bash(curl -H \"Authorization: token GITHUB_TOKEN\" https://api.github.com/user)",
+      "Bash(https://api.github.com/user/repos)",
+      "Bash(git config:*)",
+      "Bash(curl -H \"Authorization: token GITHUB_TOKEN\" https://api.github.com/user)",
+      "Bash(git add:*)",
+      "Bash(git remote set-url:*)",
+      "Bash(git remote add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
