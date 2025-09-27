@@ -16,6 +16,8 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from datasets import load_dataset, concatenate_datasets, get_dataset_config_names, load_from_disk
+import csv
+import json
 
 torch.manual_seed(0)
 if torch.cuda.is_available():
@@ -96,6 +98,46 @@ def dist_mean_scalar(x: float | int) -> float:
 def wrap_model(model):
     local_rank = int(os.environ["LOCAL_RANK"])
     return DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank)
+
+class OfflineLogger:
+    def __init__(self, log_dir, run_name):
+        self.log_dir = log_dir
+        self.run_name = run_name
+        self.csv_path = os.path.join(log_dir, f"{run_name}_metrics.csv")
+        self.json_path = os.path.join(log_dir, f"{run_name}_config.json")
+
+        # Create log directory
+        os.makedirs(log_dir, exist_ok=True)
+
+        # Initialize CSV file with headers
+        self.csv_initialized = False
+
+    def log_config(self, config_dict):
+        """Save configuration to JSON file"""
+        with open(self.json_path, 'w') as f:
+            json.dump(config_dict, f, indent=2, default=str)
+
+    def log(self, metrics, step=None):
+        """Log metrics to CSV file"""
+        if not self.csv_initialized:
+            # Initialize CSV with headers
+            headers = ['step'] + list(metrics.keys())
+            with open(self.csv_path, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(headers)
+            self.csv_initialized = True
+
+        # Append metrics to CSV
+        row = [step] + list(metrics.values())
+        with open(self.csv_path, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(row)
+
+    def summary(self, summary_dict):
+        """Save summary metrics to JSON file"""
+        summary_path = os.path.join(self.log_dir, f"{self.run_name}_summary.json")
+        with open(summary_path, 'w') as f:
+            json.dump(summary_dict, f, indent=2, default=str)
 
 def get_run_name(train_cfg, vlm_cfg):
     dataset_size = "full_ds" if train_cfg.data_cutoff_idx is None else f"{train_cfg.data_cutoff_idx}samples"
@@ -255,6 +297,16 @@ def train(train_cfg, vlm_cfg):
     if train_cfg.log_wandb and is_master():
         if train_cfg.data_cutoff_idx is None:
             run_name = run_name.replace("full_ds", f"{total_dataset_size}samples")
+    # Initialize offline logger
+    offline_logger = None
+    if is_master():
+        offline_logger = OfflineLogger("logs", run_name)
+        offline_logger.log_config({
+            "VLMConfig": asdict(vlm_cfg),
+            "TrainConfig": asdict(train_cfg),
+            "run_name": run_name
+        })
+
     if train_cfg.log_wandb and is_master():
         run = wandb.init(
             entity=train_cfg.wandb_entity,
@@ -392,21 +444,26 @@ def train(train_cfg, vlm_cfg):
                 if train_cfg.max_grad_norm is not None:
                     grad_norm = torch.nn.utils.clip_grad_norm_(all_params, max_norm=train_cfg.max_grad_norm)
 
+                # Track current learning rates
+                current_lrs = {}
                 param_group_idx = 0
                 if train_cfg.lr_mp > 0:
                     adj_lr_mp = get_lr(global_step, train_cfg.lr_mp, train_cfg.max_training_steps)
                     optimizer.param_groups[param_group_idx]['lr'] = adj_lr_mp
+                    current_lrs['lr_mp'] = adj_lr_mp
                     param_group_idx += 1
 
                 if train_cfg.lr_vision_backbone > 0:
                     adj_lr_vision_backbone = get_lr(global_step, train_cfg.lr_vision_backbone, train_cfg.max_training_steps)
                     optimizer.param_groups[param_group_idx]['lr'] = adj_lr_vision_backbone
+                    current_lrs['lr_vision_backbone'] = adj_lr_vision_backbone
                     param_group_idx += 1
 
                 if train_cfg.lr_language_backbone > 0:
                     adj_lr_language_backbone = get_lr(global_step, train_cfg.lr_language_backbone, train_cfg.max_training_steps)
                     optimizer.param_groups[param_group_idx]['lr'] = adj_lr_language_backbone
-              
+                    current_lrs['lr_language_backbone'] = adj_lr_language_backbone
+
                 optimizer.step()
                 optimizer.zero_grad()
 
@@ -476,6 +533,9 @@ def train(train_cfg, vlm_cfg):
                     
                     if is_master():
                         print(f"Step: {global_step}, Val Loss: {avg_val_loss:.4f}, Tokens/s: {tokens_per_second:.2f}")
+                        # Offline logging for validation
+                        if offline_logger:
+                            offline_logger.log({"val_loss": avg_val_loss}, step=global_step)
                         if train_cfg.log_wandb:
                             run.log({"val_loss": avg_val_loss}, step=global_step)
 
@@ -508,11 +568,18 @@ def train(train_cfg, vlm_cfg):
                 else:
                     stats['min_images_per_sample'] = min(accumulated_stats['images_per_sample'])
                 
-                # MASTER ONLY: Log to wandb
-                if train_cfg.log_wandb and is_master():
-                    run.log({
-                        **{f"training_stats/{key}": value for key, value in stats.items()},
-                    }, step=global_step)
+                # MASTER ONLY: Log to wandb and offline
+                if is_master():
+                    # Offline logging for training stats
+                    if offline_logger:
+                        offline_logger.log({
+                            **{f"training_stats/{key}": value for key, value in stats.items()},
+                        }, step=global_step)
+
+                    if train_cfg.log_wandb:
+                        run.log({
+                            **{f"training_stats/{key}": value for key, value in stats.items()},
+                        }, step=global_step)
 
                     # Check for and log new lmms-eval results
                     eval_results_dir = os.path.join('eval_results', run_name)
@@ -554,12 +621,20 @@ def train(train_cfg, vlm_cfg):
                 else:
                     batch_loss_gathered = batch_loss
                     
-                # MASTER ONLY: Log to wandb
-                if train_cfg.log_wandb and is_master():
-                    run.log({
+                # MASTER ONLY: Log to wandb and offline
+                if is_master():
+                    log_dict = {
                         "batch_loss": batch_loss_gathered,
+                        **current_lrs,
                         **({"grad_norm": grad_norm} if train_cfg.max_grad_norm is not None else {})
-                    }, step=global_step)
+                    }
+
+                    # Offline logging for batch metrics
+                    if offline_logger:
+                        offline_logger.log(log_dict, step=global_step)
+
+                    if train_cfg.log_wandb:
+                        run.log(log_dict, step=global_step)
                 
             if is_update_step:
                 global_step += 1
@@ -580,10 +655,19 @@ def train(train_cfg, vlm_cfg):
         epoch_tokens_per_second = total_tokens_processed / epoch_duration
 
         if is_master():
+            epoch_metrics = {
+                "epoch_loss": avg_train_loss,
+                "epoch_duration": epoch_duration,
+                "epoch_tokens_per_second": epoch_tokens_per_second,
+                "epoch": epoch
+            }
+
+            # Offline logging for epoch metrics
+            if offline_logger:
+                offline_logger.log(epoch_metrics, step=global_step)
+
             if train_cfg.log_wandb:
-                run.log({"epoch_loss": avg_train_loss,
-                         "epoch_duration": epoch_duration,
-                         "epoch_tokens_per_second": epoch_tokens_per_second})
+                run.log(epoch_metrics)
 
             print(f"Epoch: {epoch}, Step: {global_step}/{train_cfg.max_training_steps}, Train Loss: {avg_train_loss:.4f} | Time: {epoch_duration:.2f}s | T/s: {epoch_tokens_per_second:.2f}")
 
@@ -602,6 +686,18 @@ def train(train_cfg, vlm_cfg):
             print(f"Training complete. Pushing best model from {best_model_path} to Hugging Face Hub...")
             hf_model = VisionLanguageModel.from_pretrained(best_model_path)
             hf_model.push_to_hub(vlm_cfg.hf_repo_name)
+
+        # Save summary to offline logger
+        if offline_logger:
+            offline_logger.summary({
+                "avg_epoch_time": avg_epoch_time,
+                "avg_time_per_sample": avg_time_per_sample,
+                "total_training_time": total_training_time,
+                "total_samples_processed": total_samples_processed,
+                "final_step": global_step,
+                "best_val_loss": best_val_loss,
+                "best_model_path": best_model_path
+            })
 
         if train_cfg.log_wandb:
             run.summary["avg_epoch_time"] = avg_epoch_time

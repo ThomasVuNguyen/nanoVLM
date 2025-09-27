@@ -221,13 +221,152 @@ class VisionLanguageModel(nn.Module):
 
         # Load config
         with open(config_path, "r") as f:
-            cfg = VLMConfig(**json.load(f))
+            config_data = json.load(f)
+
+            # For SmolVLM, we need to map the config to nanoVLM format
+            if "text_config" in config_data and "vision_config" in config_data:
+                # This is a SmolVLM config, map it to nanoVLM format
+                text_config = config_data["text_config"]
+                vision_config = config_data["vision_config"]
+                connector_config = config_data.get("connector_config", {})
+
+                vlm_config_dict = {
+                    # Vision encoder config from vision_config
+                    "vit_hidden_dim": vision_config.get("hidden_size", 768),
+                    "vit_inter_dim": vision_config.get("intermediate_size", vision_config.get("hidden_size", 768) * 4),
+                    "vit_patch_size": vision_config.get("patch_size", 16),
+                    "vit_img_size": vision_config.get("image_size", 512),
+                    "vit_n_heads": vision_config.get("num_attention_heads", 12),
+                    "vit_n_blocks": vision_config.get("num_hidden_layers", 12),
+                    "vit_ln_eps": vision_config.get("layer_norm_eps", 1e-6),
+
+                    # Language model config from text_config
+                    "lm_hidden_dim": text_config.get("hidden_size", 576),
+                    "lm_inter_dim": text_config.get("intermediate_size", text_config.get("hidden_size", 576) * 4),
+                    "lm_n_heads": text_config.get("num_attention_heads", 9),
+                    "lm_n_kv_heads": text_config.get("num_key_value_heads", 3),
+                    "lm_n_blocks": text_config.get("num_hidden_layers", 30),
+                    "lm_vocab_size": text_config.get("vocab_size", 49280),
+                    "lm_max_length": text_config.get("max_position_embeddings", 8192),
+                    "lm_rms_eps": text_config.get("rms_norm_eps", 1e-5),
+
+                    # Other configs with defaults
+                    "mp_image_token_length": 64,  # Keep default
+                    "max_img_size": 2048,  # Keep default
+                }
+
+                cfg = VLMConfig(**vlm_config_dict)
+            else:
+                # Filter config data to only include fields that VLMConfig expects
+                import inspect
+                vlm_config_fields = set(inspect.signature(VLMConfig).parameters.keys())
+                filtered_config = {k: v for k, v in config_data.items() if k in vlm_config_fields}
+                cfg = VLMConfig(**filtered_config)
 
         # Initialize model without loading the backbone
         model = cls(cfg, load_backbone=False)
 
-        # Load safetensors weights
-        load_model(model, weights_path)
+        # Load safetensors weights with key mapping for SmolVLM compatibility
+        import safetensors.torch
+        state_dict = safetensors.torch.load_file(weights_path)
+
+        # Map SmolVLM keys to nanoVLM keys
+        key_mapping = {}
+
+        # Handle vision encoder QKV concatenation specially
+        vision_qkv_mappings = {}
+
+        # Map vision encoder keys
+        for key in list(state_dict.keys()):
+            if key.startswith("model.vision_model."):
+                # Remove model.vision_model. prefix and map to vision_encoder.
+                new_key = key.replace("model.vision_model.", "vision_encoder.")
+                # Map layer structure differences
+                new_key = new_key.replace("encoder.layers.", "blocks.")
+                new_key = new_key.replace("layer_norm1", "ln1")
+                new_key = new_key.replace("layer_norm2", "ln2")
+                new_key = new_key.replace("embeddings.patch_embedding", "patch_embedding.conv")
+                new_key = new_key.replace("embeddings.position_embedding", "patch_embedding.position_embedding")
+                new_key = new_key.replace("post_layernorm", "layer_norm")
+
+                # Handle QKV projection concatenation for vision encoder
+                if "self_attn.q_proj" in key or "self_attn.k_proj" in key or "self_attn.v_proj" in key:
+                    block_key = key.split("self_attn.")[0] + "attn.qkv_proj"
+                    block_key = block_key.replace("model.vision_model.encoder.layers.", "vision_encoder.blocks.")
+                    if block_key not in vision_qkv_mappings:
+                        vision_qkv_mappings[block_key] = {}
+                    if "q_proj" in key:
+                        vision_qkv_mappings[block_key]['q'] = key
+                    elif "k_proj" in key:
+                        vision_qkv_mappings[block_key]['k'] = key
+                    elif "v_proj" in key:
+                        vision_qkv_mappings[block_key]['v'] = key
+                elif "self_attn.out_proj" in key:
+                    new_key = new_key.replace("self_attn.out_proj", "attn.out_proj")
+                    key_mapping[key] = new_key
+                else:
+                    key_mapping[key] = new_key
+
+        # Map text model keys
+        for key in list(state_dict.keys()):
+            if key.startswith("model.text_model."):
+                new_key = key.replace("model.text_model.", "decoder.")
+                new_key = new_key.replace("layers.", "blocks.")
+                new_key = new_key.replace("input_layernorm", "norm1")
+                new_key = new_key.replace("post_attention_layernorm", "norm2")
+                new_key = new_key.replace("self_attn.q_proj", "attn.q_proj")
+                new_key = new_key.replace("self_attn.k_proj", "attn.k_proj")
+                new_key = new_key.replace("self_attn.v_proj", "attn.v_proj")
+                new_key = new_key.replace("self_attn.o_proj", "attn.out_proj")
+                new_key = new_key.replace("embed_tokens", "token_embedding")
+                key_mapping[key] = new_key
+
+        # Map connector/projection keys
+        for key in list(state_dict.keys()):
+            if key.startswith("model.connector.modality_projection."):
+                new_key = key.replace("model.connector.modality_projection.", "MP.")
+                key_mapping[key] = new_key
+
+        # Map LM head
+        if "lm_head.weight" in state_dict:
+            key_mapping["lm_head.weight"] = "decoder.head.weight"
+
+        # Apply key mapping
+        mapped_state_dict = {}
+        for old_key, new_key in key_mapping.items():
+            if old_key in state_dict:
+                mapped_state_dict[new_key] = state_dict[old_key]
+
+        # Handle vision encoder QKV concatenation
+        import torch
+        for qkv_key, qkv_dict in vision_qkv_mappings.items():
+            if all(k in qkv_dict for k in ['q', 'k', 'v']):
+                q_tensor = state_dict[qkv_dict['q']]
+                k_tensor = state_dict[qkv_dict['k']]
+                v_tensor = state_dict[qkv_dict['v']]
+
+                # Concatenate along the output dimension (first dimension for weights)
+                qkv_tensor = torch.cat([q_tensor, k_tensor, v_tensor], dim=0)
+                mapped_state_dict[qkv_key + ".weight"] = qkv_tensor
+
+                # Handle biases if they exist
+                q_bias_key = qkv_dict['q'].replace('.weight', '.bias')
+                k_bias_key = qkv_dict['k'].replace('.weight', '.bias')
+                v_bias_key = qkv_dict['v'].replace('.weight', '.bias')
+
+                if all(bias_key in state_dict for bias_key in [q_bias_key, k_bias_key, v_bias_key]):
+                    q_bias = state_dict[q_bias_key]
+                    k_bias = state_dict[k_bias_key]
+                    v_bias = state_dict[v_bias_key]
+                    qkv_bias = torch.cat([q_bias, k_bias, v_bias], dim=0)
+                    mapped_state_dict[qkv_key + ".bias"] = qkv_bias
+
+        # Load with strict=False to handle missing/extra keys gracefully
+        missing_keys, unexpected_keys = model.load_state_dict(mapped_state_dict, strict=False)
+        if missing_keys:
+            print(f"Warning: Missing keys in checkpoint: {missing_keys[:10]}...")  # Show first 10
+        if unexpected_keys:
+            print(f"Warning: Unexpected keys in checkpoint: {unexpected_keys[:10]}...")  # Show first 10
 
         # Done!
         return model
